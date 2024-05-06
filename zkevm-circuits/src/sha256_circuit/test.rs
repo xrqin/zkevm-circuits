@@ -1,9 +1,7 @@
 use halo2_proofs::{
-    circuit::{Layouter, SimpleFloorPlanner},
-    plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, ConstraintSystem, Error},
-    transcript::{Blake2bRead, Blake2bWrite, Challenge255},
+    circuit::{Layouter, SimpleFloorPlanner}, dev::MockProver, plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, ConstraintSystem, Error}, transcript::{Blake2bRead, Blake2bWrite, Challenge255}
 };
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng,RngCore};
 
 use super::{circuit::*, BLOCK_SIZE};
 
@@ -21,6 +19,7 @@ use halo2_proofs::{
     },
     transcript::{TranscriptReadBuffer, TranscriptWriterBuffer},
 };
+use halo2_base::utils::fs::gen_srs;
 
 const CAP_BLK: usize = 24;
 
@@ -97,19 +96,105 @@ impl Circuit<Fr> for MyCircuit {
     }
 }
 
-#[test]
-fn vk_stable() {
-    let k = 17;
+struct Blob_Circuit {
+    blob: Vec<u8>,
+}
 
-    let params: ParamsKZG<Bn256> = ParamsKZG::new(k);
-    let empty_circuit: MyCircuit = MyCircuit { blocks: 0 };
+impl Circuit<Fr> for Blob_Circuit {
+    type Config = (CircuitConfig, Challenges);
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        unimplemented!()
+    }
+
+    fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+        struct DevTable {
+            s_enable: Column<Fixed>,
+            input_rlc: Column<Advice>,
+            input_len: Column<Advice>,
+            hashes_rlc: Column<Advice>,
+            is_effect: Column<Advice>,
+        }
+
+        impl SHA256Table for DevTable {
+            fn cols(&self) -> [Column<Any>; 5] {
+                [
+                    self.s_enable.into(),
+                    self.input_rlc.into(),
+                    self.input_len.into(),
+                    self.hashes_rlc.into(),
+                    self.is_effect.into(),
+                ]
+            }
+        }
+
+        let dev_table = DevTable {
+            s_enable: meta.fixed_column(),
+            input_len: meta.advice_column(),
+            input_rlc: meta.advice_column_in(SecondPhase),
+            hashes_rlc: meta.advice_column_in(SecondPhase),
+            is_effect: meta.advice_column(),
+        };
+        meta.enable_constant(dev_table.s_enable);
+
+        let challenges = Challenges::construct(meta);
+        let chng = challenges.exprs(meta).keccak_input();
+        (CircuitConfig::configure(meta, dev_table, chng), challenges)
+    }
+
+    fn synthesize(
+        &self,
+        (config, challenges): Self::Config,
+        mut layouter: impl Layouter<Fr>,
+    ) -> Result<(), Error> {
+        let challenges = challenges.values(&layouter);
+        let chng_v = challenges.keccak_input();
+        let mut hasher = Hasher::new(config, &mut layouter)?;
+
+        // for _ in 0..self.blocks {
+        //     hasher.update(&mut layouter, chng_v, &[b'a'; BLOCK_SIZE * 4])?;
+        // }
+        hasher.update(&mut layouter, chng_v, &self.blob)?;
+        if hasher.updated_size() > 0 {
+            hasher.finalize(&mut layouter, chng_v)?;
+        }
+
+        for _ in hasher.blocks()..CAP_BLK {
+            hasher.update(&mut layouter, chng_v, &[])?;
+            hasher.finalize(&mut layouter, chng_v)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[test]
+
+fn blob_hash_test(){
+    let k = 21;
+
+    // let params: ParamsKZG<Bn256> = ParamsKZG::new(k);
+    let params = gen_srs(k);
+    let empty_circuit: Blob_Circuit = Blob_Circuit { blob: Vec::new() };
 
     // Initialize the proving key
     let vk_from_empty = keygen_vk(&params, &empty_circuit).expect("keygen_vk should not fail");
 
-    let circuit = MyCircuit { blocks: 16 };
+    let mut rng = rand::thread_rng();
+    let mut blob = vec![0; 4096];
+    rng.fill_bytes(&mut blob);
+    let circuit = Blob_Circuit { blob };
+    // let vk_time = start_timer!(|| "Generating vkey");
     let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
     let pk = keygen_pk(&params, vk, &circuit).expect("keygen_pk should not fail");
+
+    let instance = vec![];
+
+    let prover = MockProver::<Fr>::run(k, &circuit, instance).unwrap();
+
+    println!("advices_len: {:?}", prover.advices().len());
+    println!("advices_row_len: {:?}", prover.advices()[0].len());
 
     // Create a proof
     let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
